@@ -1,8 +1,44 @@
 use crate::ResultType;
 use std::{collections::HashMap, process::Command};
 
+use sctk::{
+    output::OutputData,
+    output::{OutputHandler, OutputState},
+    reexports::client::protocol::wl_output::WlOutput,
+    reexports::client::{globals, Proxy},
+    reexports::client::{Connection, QueueHandle},
+    registry::{ProvidesRegistryState, RegistryState},
+};
+
 lazy_static::lazy_static! {
     pub static ref DISTRO: Distro = Distro::new();
+}
+
+// to-do: There seems to be some runtime issue that causes the audit logs to be generated.
+// We may need to fix this and remove this workaround in the future.
+//
+// We use the pre-search method to find the command path to avoid the audit logs on some systems.
+// No idea why the audit logs happen.
+// Though the audit logs may disappear after rebooting.
+//
+// See https://github.com/rustdesk/rustdesk/discussions/11959
+//
+// `ausearch -x /usr/share/rustdesk/rustdesk` will return
+// ...
+// time->Tue Jun 24 10:40:43 2025
+// type=PROCTITLE msg=audit(1750776043.446:192757): proctitle=2F7573722F62696E2F727573746465736B002D2D73657276696365
+// type=PATH msg=audit(1750776043.446:192757): item=0 name="/usr/local/bin/sh" nametype=UNKNOWN cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+// type=CWD msg=audit(1750776043.446:192757): cwd="/"
+// type=SYSCALL msg=audit(1750776043.446:192757): arch=c000003e syscall=59 success=no exit=-2 a0=7fb7dbd22da0 a1=1d65f2c0 a2=7ffc25193360 a3=7ffc25194ec0 items=1 ppid=172208 pid=267565 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4294967295 comm="rustdesk" exe="/usr/share/rustdesk/rustdesk" subj=unconfined key="processos_criados"
+// ----
+// time->Tue Jun 24 10:40:43 2025
+// type=PROCTITLE msg=audit(1750776043.446:192758): proctitle=2F7573722F62696E2F727573746465736B002D2D73657276696365
+// type=PATH msg=audit(1750776043.446:192758): item=0 name="/usr/sbin/sh" nametype=UNKNOWN cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+// ...
+lazy_static::lazy_static! {
+    pub static ref CMD_LOGINCTL: String = find_cmd_path("loginctl");
+    pub static ref CMD_PS: String = find_cmd_path("ps");
+    pub static ref CMD_SH: String = find_cmd_path("sh");
 }
 
 pub const DISPLAY_SERVER_WAYLAND: &str = "wayland";
@@ -32,6 +68,25 @@ impl Distro {
     }
 }
 
+fn find_cmd_path(cmd: &'static str) -> String {
+    let test_cmd = format!("/bin/{}", cmd);
+    if std::path::Path::new(&test_cmd).exists() {
+        return test_cmd;
+    }
+    let test_cmd = format!("/usr/bin/{}", cmd);
+    if std::path::Path::new(&test_cmd).exists() {
+        return test_cmd;
+    }
+    if let Ok(output) = Command::new("which").arg(cmd).output() {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+    }
+    cmd.to_string()
+}
+
+// Deprecated. Use `hbb_common::platform::linux::is_kde_session()` instead for now.
+// Or we need to set the correct environment variable in the server process.
 #[inline]
 pub fn is_kde() -> bool {
     if let Ok(env) = std::env::var(XDG_CURRENT_DESKTOP) {
@@ -41,9 +96,21 @@ pub fn is_kde() -> bool {
     }
 }
 
+// Don't use `hbb_common::platform::linux::is_kde()` here.
+// It's not correct in the server process.
+pub fn is_kde_session() -> bool {
+    std::process::Command::new(CMD_SH.as_str())
+        .arg("-c")
+        .arg("pgrep -f kded[0-9]+")
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 #[inline]
 pub fn is_gdm_user(username: &str) -> bool {
-    username == "gdm"
+    username == "gdm" || username == "sddm"
     // || username == "lightgdm"
 }
 
@@ -216,14 +283,14 @@ pub fn is_session_locked(sid: &str) -> bool {
 // **Note** that the return value here, the last character is '\n'.
 // Use `run_cmds_trim_newline()` if you want to remove '\n' at the end.
 pub fn run_cmds(cmds: &str) -> ResultType<String> {
-    let output = std::process::Command::new("sh")
+    let output = std::process::Command::new(CMD_SH.as_str())
         .args(vec!["-c", cmds])
         .output()?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 pub fn run_cmds_trim_newline(cmds: &str) -> ResultType<String> {
-    let output = std::process::Command::new("sh")
+    let output = std::process::Command::new(CMD_SH.as_str())
         .args(vec!["-c", cmds])
         .output()?;
     let out = String::from_utf8_lossy(&output.stdout);
@@ -236,7 +303,7 @@ pub fn run_cmds_trim_newline(cmds: &str) -> ResultType<String> {
 
 fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output> {
     if std::env::var("FLATPAK_ID").is_ok() {
-        let mut l_args = String::from("loginctl");
+        let mut l_args = CMD_LOGINCTL.to_string();
         if let Some(a) = args.as_ref() {
             l_args = format!("{} {}", l_args, a.join(" "));
         }
@@ -247,7 +314,7 @@ fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output
             return res;
         }
     }
-    let mut cmd = std::process::Command::new("loginctl");
+    let mut cmd = std::process::Command::new(CMD_LOGINCTL.as_str());
     if let Some(a) = args {
         return cmd.args(a).output();
     }
@@ -291,6 +358,88 @@ pub fn system_message(title: &str, msg: &str, forever: bool) -> ResultType<()> {
         }
     }
     crate::bail!("failed to post system message");
+}
+
+#[derive(Debug, Clone)]
+pub struct WaylandDisplayInfo {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub logical_size: Option<(i32, i32)>,
+    pub refresh_rate: i32,
+}
+
+// Retrieves information about all connected displays via the Wayland protocol.
+pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
+    struct WaylandEnv {
+        registry_state: RegistryState,
+        output_state: OutputState,
+    }
+
+    impl OutputHandler for WaylandEnv {
+        fn output_state(&mut self) -> &mut OutputState {
+            &mut self.output_state
+        }
+
+        fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+        fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+        fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    }
+
+    impl ProvidesRegistryState for WaylandEnv {
+        fn registry(&mut self) -> &mut RegistryState {
+            &mut self.registry_state
+        }
+
+        sctk::registry_handlers!();
+    }
+
+    sctk::delegate_output!(WaylandEnv);
+    sctk::delegate_registry!(WaylandEnv);
+
+    let conn = Connection::connect_to_env()?;
+    let (globals, mut event_queue) = globals::registry_queue_init(&conn)?;
+    let queue_handle = event_queue.handle();
+
+    let registry_state = RegistryState::new(&globals);
+    let output_state = OutputState::new(&globals, &queue_handle);
+
+    let mut environment = WaylandEnv {
+        registry_state,
+        output_state,
+    };
+
+    event_queue.roundtrip(&mut environment)?;
+
+    let outputs: Vec<_> = environment.output_state.outputs().collect();
+    let mut display_infos = Vec::new();
+
+    for output in outputs {
+        if let Some(output_data) = output.data::<OutputData>() {
+            output_data.with_output_info(|info| {
+                if let Some(mode) = info.modes.iter().find(|m| m.current) {
+                    let (x, y) = info.location;
+                    let (width, height) = mode.dimensions;
+                    let refresh_rate = mode.refresh_rate;
+                    let name = info.name.clone().unwrap_or_default();
+                    let logical_size = info.logical_size;
+                    display_infos.push(WaylandDisplayInfo {
+                        name,
+                        x,
+                        y,
+                        width,
+                        height,
+                        logical_size,
+                        refresh_rate,
+                    });
+                }
+            });
+        }
+    }
+
+    Ok(display_infos)
 }
 
 #[cfg(test)]
